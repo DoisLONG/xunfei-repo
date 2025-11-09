@@ -60,10 +60,9 @@
 <script>
 (() => {
   // ===== 配置 =====
-  // const WS_URL_HOST = '192.168.1.103:8001'; // ← 改成你的后端地址（或置空用反代：location.host）
+  const WS_URL = 'ws://153.35.82.15:8001/ws/voice';
   // const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + (WS_URL_HOST || location.host) + '/ws/voice';
-  const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://')
-               + location.host + '/ws/voice';
+  // const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/voice';
   const CHUNK_MS = 1000;
   const MIME_CANDIDATES = [
     'audio/ogg;codecs=opus',
