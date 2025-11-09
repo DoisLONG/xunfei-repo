@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>语音流式对话 · 前端模板（稳版）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:16px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    button { padding:10px 14px; border-radius:10px; border:1px solid #ddd; background:#fff; cursor:pointer; }
+    button.primary{ background:#0ea5e9;color:#fff;border-color:#0ea5e9; }
+    button.danger{ background:#ef4444;color:#fff;border-color:#ef4444; }
+    .pill{ padding:4px 10px;border-radius:999px;background:#f1f5f9;font-size:12px; }
+    .log{ background:#0b1020;color:#d1e6ff;padding:10px;border-radius:8px;height:180px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px; }
+    .box{ border:1px solid #e5e7eb;border-radius:12px;padding:12px; }
+    .partial{ color:#475569; min-height:24px; }
+    .final{ color:#0f172a; white-space:pre-wrap; }
+    audio{ width:100%; }
+    .muted{ opacity:.7; }
+    .warn{ color:#b45309; }
+    .ok{ color:#059669; }
+  </style>
+</head>
+<body>
+  <h2>语音流式对话 · 前端模板（稳版）</h2>
+
+  <div class="row" style="margin-bottom:10px;">
+    <div>编码类型：</div>
+    <span id="mime" class="pill">检测中…</span>
+    <span class="pill">分片时长：<b>1000ms</b></span>
+    <span id="wsState" class="pill">WS 未连接</span>
+    <span id="audioState" class="pill warn">音频未解锁</span>
+  </div>
+
+  <div class="row" style="margin-bottom:12px;">
+    <button id="btnInit" class="primary">初始化音频（解锁自动播放）</button>
+    <button id="btnConnect">连接后端</button>
+    <button id="btnStart" class="primary">开始说话</button>
+    <button id="btnStop" class="danger">停止</button>
+    <label class="pill"><input id="cbAutoScroll" type="checkbox" checked/> 自动滚动日志</label>
+  </div>
+
+  <div class="box" style="margin-bottom:12px;">
+    <div><b>转写（实时）</b></div>
+    <div class="partial" id="partialText"></div>
+    <div class="final" id="finalText"></div>
+  </div>
+
+  <div class="box" style="margin-bottom:12px;">
+    <div><b>TTS 播放队列</b></div>
+    <audio id="player" controls class="muted"></audio>
+    <div id="queueList" class="partial">队列为空</div>
+  </div>
+
+  <div class="box">
+    <div style="margin-bottom:6px;"><b>调试日志</b></div>
+    <div id="log" class="log"></div>
+  </div>
+
+<script>
+(() => {
+  // ===== 配置 =====
+  const WS_URL_HOST = '192.168.1.103:8001'; // ← 改成你的后端地址（或置空用反代：location.host）
+  const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + (WS_URL_HOST || location.host) + '/ws/voice';
+  const CHUNK_MS = 1000;
+  const MIME_CANDIDATES = ['audio/ogg;codecs=opus','audio/webm;codecs=opus','audio/webm','audio/mp4'];
+
+  // ===== 元素 =====
+  const elMime = document.getElementById('mime');
+  const elWsState = document.getElementById('wsState');
+  const elAudioState = document.getElementById('audioState');
+  const elLog = document.getElementById('log');
+  const elPartial = document.getElementById('partialText');
+  const elFinal = document.getElementById('finalText');
+  const elQueue = document.getElementById('queueList');
+  const elPlayer = document.getElementById('player');
+  const btnInit = document.getElementById('btnInit');
+  const btnConnect = document.getElementById('btnConnect');
+  const btnStart = document.getElementById('btnStart');
+  const btnStop = document.getElementById('btnStop');
+  const cbAutoScroll = document.getElementById('cbAutoScroll');
+
+  // ===== 状态 =====
+  let ws=null, mediaStream=null, recorder=null, mimeType=null, started=false, audioUnlocked=false;
+
+  // 日志
+  function log(...args){
+    const s = args.map(a => (typeof a==='string'?a:JSON.stringify(a))).join(' ');
+    elLog.textContent += s + '\n';
+    if (cbAutoScroll.checked) elLog.scrollTop = elLog.scrollHeight;
+  }
+
+  function pickSupportedMime(){
+    for (const m of MIME_CANDIDATES){ if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m; }
+    return '';
+  }
+
+  // 播放队列
+  class AudioQueue{
+    constructor(player){
+      this.player = player; this.queue = []; this.playing=false;
+      player.addEventListener('ended', ()=>this._next());
+      player.addEventListener('error', e=>{ log('Audio error', e?.message||''); this._next(); });
+    }
+    push(url){ this.queue.push(url); this._render(); if(!this.playing) this._next(); }
+    clear(){ this.queue=[]; this.playing=false; this.player.removeAttribute('src'); this._render(); }
+    _next(){
+      const url = this.queue.shift(); this._render();
+      if(!url){ this.playing=false; return; }
+      this.playing=true; this.player.src=url;
+      this.player.play().then(()=>{
+        elAudioState.textContent='已解锁'; elAudioState.classList.remove('warn'); elAudioState.classList.add('ok');
+      }).catch(err=>{ log('Autoplay blocked, waiting user gesture', err?.message||''); });
+    }
+    _render(){ elQueue.textContent = this.queue.length ? `待播清单（${this.queue.length}）：\n- `+this.queue.join('\n- ') : '队列为空'; }
+  }
+  const audioQ = new AudioQueue(elPlayer);
+
+  // 解锁音频
+  async function unlockAudio(){
+    try{
+      const ctx = new (window.AudioContext||window.webkitAudioContext)(); await ctx.resume();
+      const osc = ctx.createOscillator(); osc.connect(ctx.destination); osc.start(); osc.stop(ctx.currentTime+0.01);
+      audioUnlocked = true; elPlayer.classList.remove('muted');
+      elAudioState.textContent='已解锁'; elAudioState.classList.remove('warn'); elAudioState.classList.add('ok');
+      log('Audio unlocked');
+    }catch(e){ log('Audio unlock failed', e?.message||e); }
+  }
+
+  // 连接 WS
+  function connectWS(){
+    if (ws && ws.readyState===WebSocket.OPEN) return;
+    ws = new WebSocket(WS_URL); ws.binaryType='arraybuffer';
+    ws.onopen = ()=>{ elWsState.textContent='WS 已连接'; log('[WS] open'); ws.send(JSON.stringify({type:'start', mime:mimeType||''})); };
+    ws.onclose= ()=>{ elWsState.textContent='WS 已关闭'; log('[WS] close'); };
+    ws.onerror= e =>{ log('[WS] error', e?.message||''); };
+    ws.onmessage = ev=>{
+      try{
+        const msg = JSON.parse(ev.data);
+        if (msg.type==='partial'){ elPartial.textContent = msg.text||''; }
+        else if (msg.type==='final'){ elPartial.textContent=''; elFinal.textContent += (msg.text? (msg.text+'\n'): ''); }
+        else if (msg.type==='tts' && msg.url){ audioQ.push(msg.url); }
+        else if (msg.type==='info'){ log('[INFO]', msg.message||''); }
+        else if (msg.type==='error'){ log('[ERR]', msg.message||''); }
+      }catch{}
+    };
+  }
+
+  // 开始/停止
+  async function start(){
+    if(started){return;}
+    if(!ws || ws.readyState!==WebSocket.OPEN){ log('请先连接 WS'); return; }
+    mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    recorder = new MediaRecorder(mediaStream, mimeType?{mimeType}:{});
+    recorder.ondataavailable = e=>{ if(e.data && e.data.size>0){ e.data.arrayBuffer().then(buf=>{ if(ws && ws.readyState===WebSocket.OPEN){ ws.send(buf); } }); } };
+    recorder.onstart= ()=>{ started=true; log('[REC] start'); };
+    recorder.onstop = ()=>{ log('[REC] stop'); };
+    recorder.start(1000); // 1000ms 一片
+  }
+
+  function stop(){
+    if(recorder && recorder.state!=='inactive') recorder.stop();
+    if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
+    started=false; if(ws && ws.readyState===WebSocket.OPEN){ ws.send(JSON.stringify({type:'stop'})); }
+    setTimeout(()=>{ elPartial.textContent=''; }, 50);
+  }
+
+  // 初始化
+  mimeType = pickSupportedMime();
+  elMime.textContent = mimeType || '(浏览器自选)';
+  btnInit.addEventListener('click', unlockAudio);
+  btnConnect.addEventListener('click', connectWS);
+  btnStart.addEventListener('click', start);
+  btnStop.addEventListener('click', stop);
+  ['click','touchstart'].forEach(evt=>document.addEventListener(evt, ()=>{ if(!audioUnlocked) unlockAudio(); }, {once:true}));
+
+  log('准备就绪。步骤：①点“初始化音频” ②点“连接后端” ③点“开始说话”。 说完停 0.8–1s 再点“停止”。');
+})();
+</script>
+</body>
+</html>
