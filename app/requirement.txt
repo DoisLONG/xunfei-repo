@@ -1,6 +1,4 @@
-fastapi
-uvicorn[standard]
-websockets
-requests
-websocket-client
-python-dotenv
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websocket-client==1.8.0
+starlette==0.38.5
