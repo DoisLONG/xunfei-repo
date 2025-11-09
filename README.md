@@ -12,4 +12,9 @@ docker run --rm -p 8001:8001 \
   xfyun-voice:dev
 --
 1、前端：镜像构建，docker build -t xfyun-voice-frontend:latest .
-2、运行：docker run -d --name xfyun-voice-frontend -p 30280:80 xfyun-voice-frontend:latest
+2、运行：
+docker run -d --name xfyun-voice-frontend -p 30280:80 xfyun-voice-frontend:latest
+
+docker run -d --name xfyun-voice-frontend -p 30280:80 \
+  --add-host=host.docker.internal:host-gateway \
+  xfyun-voice-frontend:v0.4
