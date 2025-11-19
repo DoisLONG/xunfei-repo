@@ -1,420 +1,277 @@
-import os, ssl, hmac, json, time, base64, hashlib, asyncio, logging, threading, subprocess, uuid
-from typing import Callable, Optional
-from urllib.parse import quote, urlencode
-from email.utils import formatdate
+import os, ssl, hmac, json, base64, hashlib, asyncio, logging, uuid, datetime
 from pathlib import Path
-
-import requests
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Optional, Callable
+from urllib.parse import quote
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from starlette.websockets import WebSocketState
+from fastapi.responses import FileResponse, JSONResponse
 from websocket import create_connection, WebSocketConnectionClosedException
+import struct
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+# --------- 环境与目录 ---------
 ROOT = Path(__file__).parent.resolve()
-WWW_DIR = ROOT / "static" / "www"
-TTS_DIR = ROOT / "static" / "tts"
-WWW_DIR.mkdir(parents=True, exist_ok=True)
-TTS_DIR.mkdir(parents=True, exist_ok=True)
-(WWW_DIR / "index.html").touch(exist_ok=True)  # 防 404
+WWW = ROOT / "static" / "www"; WWW.mkdir(parents=True, exist_ok=True)
+TTS_DIR = ROOT / "static" / "tts"; TTS_DIR.mkdir(parents=True, exist_ok=True)
+(WWW / "index.html").write_text("<h3>TCP Voice Gateway is running.</h3>", encoding="utf-8")
 
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
+XF_APP_ID     = os.getenv("XF_APP_ID", "").strip()
+XF_API_KEY    = os.getenv("XF_API_KEY", "").strip()
+XF_API_SECRET = os.getenv("XF_API_SECRET", "").strip()
+TTS_VCN       = os.getenv("TTS_VCN", "xiaoyan").strip()
+TCP_HOST      = os.getenv("TCP_HOST", "0.0.0.0")
+TCP_PORT      = int(os.getenv("TCP_PORT", "38001"))
+assert XF_APP_ID and XF_API_KEY and XF_API_SECRET, "请配置 XF_APP_ID / XF_API_KEY / XF_API_SECRET"
+
+# --------- Web 服务（用于暴露静态 mp3）---------
+app = FastAPI(title="TCP Voice Gateway")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 
 @app.get("/")
-def index():
-    return FileResponse(str(WWW_DIR / "index.html"))
+def index(): return FileResponse(str(WWW / "index.html"))
+@app.get("/health")
+def health(): return {"ok": True, "tcp": f"{TCP_HOST}:{TCP_PORT}"}
 
-# ===== 讯飞三元组（请保证开通 IAT 与 语音合成 WebAPI v2）=====
-XF_APP_ID     = os.getenv("XF_APP_ID", "").strip()     or "your_appid"
-XF_API_KEY    = os.getenv("XF_API_KEY", "").strip()    or "your_apikey"
-XF_API_SECRET = os.getenv("XF_API_SECRET", "").strip() or "your_apisecret"
+# --------- 协议常量（小端）---------
+HD_SIZE = 32  # 8 * uint32
+SOF = 0x000000AA  # 你给的注释“byte0=0xAA”，这里直接用 0xAA
+CMD_SPEECH = 0x87     # 设备->服务器：语音帧(PCM 16k 16bit mono)
+CMD_INFORM = 0x94     # 服务器->设备：播放URL通知
+CMD_HEART  = 0x01     # 心跳(设备->服务器)，服务器回同 cmd
+FMT_PCM16  = 0x01     # u32fmt=01
 
-def _assert_cfg():
-    assert XF_APP_ID and XF_API_KEY and XF_API_SECRET, "请配置 XF_APP_ID/XF_API_KEY/XF_API_SECRET 环境变量，并开通相应服务"
-_assert_cfg()
+# --------- 打包/解包工具（小端）---------
+def pack_header(sof, length, sendid, recvid, u32fmt, cmd, res, res2):
+    return struct.pack("<8I", sof, length, sendid, recvid, u32fmt, cmd, res, res2)
 
-# ===== 工具：WS/IAT 鉴权（GET request-line）、TTS 鉴权（POST request-line）=====
-def build_xfyun_wss_url(host: str, path: str) -> str:
-    """IAT 使用 wss，签名 request-line 为 GET"""
-    date = formatdate(usegmt=True)
-    origin = f"host: {host}\n" f"date: {date}\n" f"GET {path} HTTP/1.1"
-    sign = hmac.new(XF_API_SECRET.encode(), origin.encode(), hashlib.sha256).digest()
-    signature = base64.b64encode(sign).decode()
-    auth_origin = (
-        f'api_key="{XF_API_KEY}", algorithm="hmac-sha256", headers="host date request-line", signature="{signature}"'
-    )
-    authorization = base64.b64encode(auth_origin.encode()).decode()
-    return f"wss://{host}{path}?authorization={authorization}&date={quote(date)}&host={host}"
+def unpack_header(data: bytes):
+    sof, length, sendid, recvid, u32fmt, cmd, res, res2 = struct.unpack("<8I", data)
+    return {"sof": sof, "len": length, "sendid": sendid, "recvid": recvid,
+            "fmt": u32fmt, "cmd": cmd, "res": res, "res2": res2}
 
-def build_xfyun_http_url(host: str, path: str, method: str = "POST") -> str:
-    """TTS v2 使用 HTTPS，签名 request-line 必须与实际 method 一致（POST）"""
-    date = formatdate(usegmt=True)
-    origin = f"host: {host}\n" f"date: {date}\n" f"{method} {path} HTTP/1.1"
-    sign = hmac.new(XF_API_SECRET.encode(), origin.encode(), hashlib.sha256).digest()
-    signature = base64.b64encode(sign).decode()
-    auth_origin = (
-        f'api_key="{XF_API_KEY}", algorithm="hmac-sha256", headers="host date request-line", signature="{signature}"'
-    )
-    authorization = base64.b64encode(auth_origin.encode()).decode()
-    return f"https://{host}{path}?{urlencode({'authorization': authorization, 'date': date, 'host': host})}"
+# --------- 讯飞鉴权 ---------
+def build_wss_url(host: str, path: str) -> str:
+    date = datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    signature_origin = f"host: {host}\n" f"date: {date}\n" f"GET {path} HTTP/1.1"
+    digest = hmac.new(XF_API_SECRET.encode(), signature_origin.encode(), hashlib.sha256).digest()
+    signature = base64.b64encode(digest).decode()
+    authorization_origin = (f'api_key="{XF_API_KEY}", algorithm="hmac-sha256", '
+                            f'headers="host date request-line", signature="{signature}"')
+    authorization = base64.b64encode(authorization_origin.encode()).decode()
+    return f"wss://{host}{path}?authorization={quote(authorization)}&date={quote(date)}&host={host}"
 
-# ===== 讯飞 IAT 会话（WS）=====
+# --------- IAT 会话（吃 PCM16k）---------
 class IATSession:
-    def __init__(self, loop: asyncio.AbstractEventLoop,
+    def __init__(self,
                  on_partial: Callable[[str], None],
                  on_final: Callable[[str], None]):
-        self.loop = loop
+        self.closed = False
         self.on_partial = on_partial
         self.on_final = on_final
-        self.closed = False
-        url = build_xfyun_wss_url("iat-api.xfyun.cn", "/v2/iat")
+        url = build_wss_url("iat-api.xfyun.cn", "/v2/iat")
         self.ws = create_connection(url, sslopt={"cert_reqs": ssl.CERT_NONE})
-
         first = {
             "common": {"app_id": XF_APP_ID},
             "business": {
                 "language": "zh_cn", "domain": "iat", "accent": "mandarin",
-                "vad_eos": 3000
+                "vinfo": 1, "vad_eos": 3000
             },
             "data": {"status": 0, "format": "audio/L16;rate=16000", "encoding": "raw", "audio": ""}
         }
         self.ws.send(json.dumps(first))
-        self.t = threading.Thread(target=self._recv_loop, daemon=True)
-        self.t.start()
+        self.t = asyncio.get_event_loop().run_in_executor(None, self._recv_loop)
 
     def _recv_loop(self):
         try:
             while not self.closed:
                 msg = self.ws.recv()
-                if not msg:
-                    continue
+                if not msg: continue
                 data = json.loads(msg)
                 if data.get("code", 0) != 0:
-                    logging.warning("[IAT] error: %s", data)
-                    continue
-                result = data.get("data", {})
-                status = result.get("status")
-                if "result" in result:
-                    ws = result["result"].get("ws", [])
+                    logging.warning("[IAT] err: %s", data); continue
+                d = data.get("data", {})
+                st = d.get("status")
+                if "result" in d:
+                    ws = d["result"].get("ws", [])
                     text = "".join([w["cw"][0]["w"] for w in ws if w.get("cw")])
-                    if status in (0, 1):
-                        self.loop.call_soon_threadsafe(self.on_partial, text)
-                    elif status == 2:
-                        self.loop.call_soon_threadsafe(self.on_final, text)
+                    if st in (0, 1):
+                        self.on_partial(text)
+                    elif st == 2:
+                        self.on_final(text)
         except WebSocketConnectionClosedException:
             pass
         except Exception as e:
             logging.exception("[IAT] recv error: %s", e)
 
-    def send_pcm(self, pcm: bytes, is_last: bool = False):
-        if self.closed:
-            return
+    def send_pcm(self, pcm: bytes, last: bool=False):
+        if self.closed: return
         frame = {"data": {
-            "status": 2 if is_last else 1,
-            "format": "audio/L16;rate=16000",
-            "encoding": "raw",
-            "audio": base64.b64encode(pcm).decode()
+            "status": 2 if last else 1, "format": "audio/L16;rate=16000",
+            "encoding": "raw", "audio": base64.b64encode(pcm).decode()
         }}
-        try:
-            self.ws.send(json.dumps(frame))
-        except Exception:
-            self.closed = True
+        try: self.ws.send(json.dumps(frame))
+        except Exception: self.closed = True
 
     def close(self):
-        if self.closed: 
-            return
+        if self.closed: return
         try:
-            self.send_pcm(b"", is_last=True)
+            self.send_pcm(b"", last=True)
             self.ws.close()
         finally:
             self.closed = True
 
-# ===== 讯飞 TTS（HTTPS POST，返回 mp3 bytes）=====
-# ===== 讯飞 TTS（WebSocket v2，返回 mp3 bytes）=====
-def xfyun_tts_bytes(text: str, vcn: str = "xiaoyan", aue: str = "lame") -> bytes:
-    """
-    适配“在线语音合成（流式版）”——必须走 WebSocket:
-    端点: wss://tts-api.xfyun.cn/v2/tts
-    鉴权: HMAC + GET request-line（与 IAT 相同）
-    aue="lame" -> mp3; 也可 "raw" / "speex" 等
-    """
-    url = build_xfyun_wss_url("tts-api.xfyun.cn", "/v2/tts")
+# --------- TTS（WebSocket流式，返回mp3字节）---------
+def tts_synth_to_mp3(text: str) -> bytes:
+    url = build_wss_url("tts-api.xfyun.cn", "/v2/tts")
     ws = create_connection(url, sslopt={"cert_reqs": ssl.CERT_NONE})
+    first = {
+        "common": {"app_id": XF_APP_ID},
+        "business": {"aue": "lame", "vcn": TTS_VCN, "tte": "UTF8", "speed": 50, "pitch": 50, "volume": 50},
+        "data": {"status": 2, "text": base64.b64encode(text.encode("utf-8")).decode("utf-8")}
+    }
+    ws.send(json.dumps(first))
+    buf = bytearray()
+    try:
+        while True:
+            resp = json.loads(ws.recv())
+            if resp.get("code", 0) != 0:
+                raise RuntimeError(f"TTS error: {resp}")
+            d = resp.get("data", {})
+            if "audio" in d:
+                buf += base64.b64decode(d["audio"])
+            if d.get("status") == 2:
+                break
+    finally:
+        ws.close()
+    return bytes(buf)
+
+# --------- 会话状态 ---------
+class ConnState:
+    def __init__(self, writer: asyncio.StreamWriter):
+        self.writer = writer
+        self.sendid = 0
+        self.peer_last = 0
+        self.iat: Optional[IATSession] = None
+        self.partial = ""
+        self.final = ""
+        self.buffer = bytearray()
+
+    def next_id(self):
+        self.sendid = (self.sendid + 1) & 0xFFFFFFFF
+        return self.sendid
+
+# --------- 发送通知（URL）---------
+async def send_inform_url(st: ConnState, url: str, record_after_play: int = 1):
+    payload = url.encode("utf-8") + b"\x00"
+    length = HD_SIZE + len(payload)
+    hd = pack_header(SOF, length, st.next_id(), st.peer_last, FMT_PCM16, CMD_INFORM, record_after_play, 0)
+    st.writer.write(hd + payload)
+    await st.writer.drain()
+    logging.info("-> inform url (%dB): %s", len(payload), url)
+
+# --------- 发送心跳回包 ---------
+async def send_heartbeat(st: ConnState):
+    length = HD_SIZE
+    hd = pack_header(SOF, length, st.next_id(), st.peer_last, FMT_PCM16, CMD_HEART, 0, 0)
+    st.writer.write(hd)
+    await st.writer.drain()
+
+# --------- LLM 占位（你明天接入真正大模型时换掉）---------
+def llm_reply(recognized_text: str) -> str:
+    if not recognized_text.strip():
+        return "抱歉，没有识别到有效语音。"
+    return f"我听到你说：“{recognized_text}”。已收到～"
+
+# --------- TCP 连接处理 ---------
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    peer = writer.get_extra_info("peername")
+    logging.info("TCP connected: %s", peer)
+    st = ConnState(writer)
 
     try:
-        first = {
-            "common": {"app_id": XF_APP_ID},
-            "business": {
-                "aue": aue,        # mp3
-                "vcn": vcn,        # 例：xiaoyan；若开通 x4 系列，可用 x4_xiaoyan
-                "tte": "UTF8",
-                "speed": 50,
-                "volume": 50,
-                "pitch": 50,
-                "sfl": 1           # 流式返回
-            },
-            "data": {
-                "status": 2,       # 一次性提交文本，直接结束
-                "text": base64.b64encode(text.encode("utf-8")).decode("utf-8")
-            }
-        }
-        ws.send(json.dumps(first))
-
-        audio = bytearray()
-        sid = None
-
+        buf = bytearray()
         while True:
-            msg = ws.recv()
-            if not msg:
-                break
-            resp = json.loads(msg)
-            code = resp.get("code", 0)
-            sid = resp.get("sid")
-            if code != 0:
-                raise RuntimeError(f"XF TTS error code={code}, msg={resp.get('message')}, sid={sid}")
+            chunk = await reader.read(4096)
+            if not chunk: break
+            buf += chunk
 
-            data = resp.get("data", {})
-            if "audio" in data:
-                audio.extend(base64.b64decode(data["audio"]))
+            # 解析粘包
+            while True:
+                if len(buf) < HD_SIZE: break
+                hd = unpack_header(buf[:HD_SIZE])
+                if hd["sof"] != SOF:  # 丢弃到下一个可能的头
+                    del buf[0:1]; continue
+                total_len = hd["len"]
+                if total_len < HD_SIZE or len(buf) < total_len: break
 
-            if data.get("status") == 2:  # 结束
-                break
+                frame = bytes(buf[:total_len]); del buf[:total_len]
+                head = unpack_header(frame[:HD_SIZE])
+                payload = frame[HD_SIZE:]
+                st.peer_last = head["sendid"]
 
-        if not audio:
-            raise RuntimeError(f"XF TTS empty audio, sid={sid}")
+                cmd, res = head["cmd"], head["res"]
 
-        return bytes(audio)
+                if cmd == CMD_HEART:
+                    # 心跳：立即回包
+                    await send_heartbeat(st)
+                    continue
 
+                if cmd == CMD_SPEECH:
+                    # 设备直吐 PCM16k/16bit/mono
+                    if res == 0:  # 首帧
+                        st.partial = ""; st.final = ""
+                        if st.iat: st.iat.close()
+                        st.iat = IATSession(
+                            on_partial=lambda t: setattr(st, "partial", t),
+                            on_final  =lambda t: setattr(st, "final", t)
+                        )
+                    if st.iat:
+                        st.iat.send_pcm(payload, last=(res==2))
+
+                    if res == 2:  # 尾帧 -> 收口，做 TTS 并下发 URL
+                        await asyncio.sleep(0.25)
+                        if st.iat:
+                            st.iat.close(); st.iat = None
+                        rec_text = st.final or st.partial
+                        logging.info("[ASR] %s", rec_text)
+                        # （这里接入你的大模型）
+                        answer = llm_reply(rec_text)
+                        # 讯飞 TTS 合成
+                        try:
+                            mp3 = await asyncio.get_event_loop().run_in_executor(None, tts_synth_to_mp3, answer)
+                        except Exception as e:
+                            logging.exception("TTS failed: %s", e)
+                            continue
+                        mp3_name = f"{uuid.uuid4().hex}.mp3"
+                        (TTS_DIR / mp3_name).write_bytes(mp3)
+                        url = f"/static/tts/{mp3_name}"
+                        await send_inform_url(st, url, record_after_play=1)
+                    continue
+
+                # 未知命令：忽略
+    except Exception as e:
+        logging.exception("TCP error %s: %s", peer, e)
     finally:
         try:
-            ws.close()
-        except Exception:
-            pass
+            if st.iat: st.iat.close()
+        except: pass
+        writer.close()
+        await writer.wait_closed()
+        logging.info("TCP closed: %s", peer)
 
-# ===== webm/opus → 16k PCM（ffmpeg）=====
-class OpusToPcm:
-    def __init__(self, mime: str):
-        self.proc = subprocess.Popen(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "webm" if "webm" in mime.lower() else "ogg",
-                "-fflags", "+genpts",
-                "-use_wallclock_as_timestamps", "1",
-                "-i", "pipe:0",
-                "-ac", "1", "-ar", "16000",
-                "-f", "s16le", "-acodec", "pcm_s16le",
-                "pipe:1",
-            ],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
-        )
-        self.stdin = self.proc.stdin
-        self.stdout = self.proc.stdout
+# --------- 启动 TCP server ---------
+@app.on_event("startup")
+async def _start_tcp():
+    server = await asyncio.start_server(handle_client, TCP_HOST, TCP_PORT)
+    app.state.tcp_server = server
+    host, port = server.sockets[0].getsockname()
+    logging.info("TCP server listening on %s:%s", host, port)
 
-    def close(self):
-        try:
-            if self.stdin and not self.stdin.closed:
-                self.stdin.close()
-        except Exception:
-            pass
-        try:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-        except Exception:
-            pass
-
-# ===== 健康检查 =====
-@app.get("/health")
-def health():
-    return {"ok": True, "xf_app": XF_APP_ID[:4] + "..." + XF_APP_ID[-4:], "tts_dir": str(TTS_DIR)}
-
-# ===== WebSocket：语音上行 + IAT 转写 + 自动 TTS 回推 =====
-@app.websocket("/ws/voice")
-async def ws_voice(ws: WebSocket):
-    await ws.accept()
-    loop = asyncio.get_running_loop()
-
-    async def post(obj: dict):
-        if ws.application_state == WebSocketState.CONNECTED:
-            await ws.send_text(json.dumps(obj, ensure_ascii=False))
-
-    await post({"type": "info", "message": "connected"})
-
-    trans: Optional[OpusToPcm] = None
-    iat: Optional[IATSession] = None
-    mime = "audio/webm;codecs=opus"
-    stop_flag = False
-    asr_full_text = ""
-
-    # WS 分片 → ffmpeg.stdin
-    q_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=32)
-    def _append_final(t: str):
-        nonlocal asr_full_text
-        asr_full_text += t
-        asyncio.run_coroutine_threadsafe(post({"type": "final", "text": t}), loop)
-
-    async def writer():
-        nonlocal trans
-        try:
-            while not stop_flag:
-                chunk = await q_in.get()
-                if trans and trans.stdin:
-                    try:
-                        trans.stdin.write(chunk)
-                        trans.stdin.flush()
-                    except Exception:
-                        break
-        except asyncio.CancelledError:
-            pass
-
-    async def pump_pcm():
-        """ffmpeg.stdout → 讯飞"""
-        try:
-            while not stop_flag and trans and trans.stdout:
-                pcm = await loop.run_in_executor(None, trans.stdout.read, 3200)
-                if not pcm:
-                    await asyncio.sleep(0.01)
-                    continue
-                if iat:
-                    iat.send_pcm(pcm, is_last=False)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logging.warning("pump_pcm error: %s", e)
-
-    writer_task: Optional[asyncio.Task] = None
-    pump_task: Optional[asyncio.Task] = None
-
-    async def ensure_pipeline():
-        nonlocal trans, iat, writer_task, pump_task
-        if trans is None:
-            trans = OpusToPcm(mime)
-            logging.info("Pipeline created (mime=%s)", mime)
-            iat = IATSession(
-                loop,
-                on_partial=lambda t: asyncio.run_coroutine_threadsafe(
-                    post({"type": "partial", "text": t}), loop
-                ),
-                on_final=_append_final,
-            )
-            writer_task = asyncio.create_task(writer())
-            pump_task = asyncio.create_task(pump_pcm())
-
-    async def safe_receive():
-        try:
-            return await ws.receive()
-        except RuntimeError as e:
-            if "disconnect message" in str(e):
-                return {"type": "disconnect"}
-            raise
-        except asyncio.CancelledError:
-            return {"type": "cancel"}
-
-    logging.info("WS connected, waiting frames...")
-
-    try:
-        # 可能的 start 文本帧
-        first = await safe_receive()
-        if first.get("text"):
-            try:
-                m = json.loads(first["text"])
-                if m.get("type") == "start":
-                    mime = m.get("mime") or mime
-                    await post({"type": "info", "message": f"start received, mime={mime}"})
-            except Exception:
-                pass
-        elif first.get("bytes"):
-            await ensure_pipeline()
-            await q_in.put(first["bytes"])
-
-        # —— 主循环 —— #
-        while True:
-            event = await safe_receive()
-            t = event.get("type")
-            if t in ("disconnect", "cancel"):
-                break
-
-            if event.get("bytes") is not None:
-                b = event["bytes"]
-                if not b:
-                    continue
-                if trans is None:
-                    await ensure_pipeline()
-                await q_in.put(b)
-
-            elif event.get("text") is not None:
-                try:
-                    data = json.loads(event["text"])
-                except Exception:
-                    continue
-                if data.get("type") == "stop":
-                    stop_flag = True
-                    await post({"type": "info", "message": "stopping"})
-                    break
-
-        # flush & last frame
-        await asyncio.sleep(0.30)
-        if iat:
-            iat.send_pcm(b"", is_last=True)
-        await asyncio.sleep(0.25)
-
-        # —— 模拟大模型回答 + 自动 TTS —— #
-        reply = f"我听到了：“{asr_full_text.strip()}”。这是模拟回答：好的，已收到～"
-        await post({"type": "llm", "text": reply})
-        try:
-            mp3 = xfyun_tts_bytes(reply, vcn="xiaoyan")
-            name = f"{uuid.uuid4().hex}.mp3"
-            out = TTS_DIR / name
-            out.write_bytes(mp3)
-            await post({"type": "tts", "url": f"/static/tts/{name}"})
-            await post({"type": "info", "message": f"TTS ok, size={len(mp3)} bytes"})
-        except Exception as e:
-            await post({"type": "error", "message": f"TTS失败: {e}"})
-
-    except WebSocketDisconnect:
-        pass
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logging.exception("/ws/voice error: %s", e)
-        await post({"type": "error", "message": str(e)})
-    finally:
-        stop_flag = True
-        for task in (writer_task, pump_task):
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        try:
-            if trans:
-                trans.close()
-        except Exception:
-            pass
-        try:
-            if iat:
-                iat.close()
-        except Exception:
-            pass
-        if ws.application_state == WebSocketState.CONNECTED:
-            await ws.close()
-
-# ===== 可选：REST 直呼 TTS（被“模拟回答”按钮使用）=====
-@app.get("/api/tts")
-def api_tts(text: str):
-    try:
-        b = xfyun_tts_bytes(text)
-        name = f"{uuid.uuid4().hex}.mp3"
-        (TTS_DIR / name).write_bytes(b)
-        return {"ok": True, "url": f"/static/tts/{name}", "size": len(b)}
-    except Exception as e:
-        return {"ok": False, "message": str(e)}
+@app.on_event("shutdown")
+async def _stop_tcp():
+    srv = getattr(app.state, "tcp_server", None)
+    if srv: srv.close(); await srv.wait_closed()
