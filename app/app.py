@@ -1,277 +1,331 @@
-import os, ssl, hmac, json, base64, hashlib, asyncio, logging, uuid, datetime
-from pathlib import Path
-from typing import Optional, Callable
-from urllib.parse import quote
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from websocket import create_connection, WebSocketConnectionClosedException
-import struct
+import os, time, uuid, logging, json, asyncio
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, Depends, Query
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from pydantic import BaseModel, Field
 
-# --------- 环境与目录 ---------
-ROOT = Path(__file__).parent.resolve()
-WWW = ROOT / "static" / "www"; WWW.mkdir(parents=True, exist_ok=True)
-TTS_DIR = ROOT / "static" / "tts"; TTS_DIR.mkdir(parents=True, exist_ok=True)
-(WWW / "index.html").write_text("<h3>TCP Voice Gateway is running.</h3>", encoding="utf-8")
+# ---------- 配置 ----------
+HEARTBEAT_INTERVAL_DEFAULT = int(os.getenv("HB_INTERVAL", "30"))       # 设备心跳建议间隔（秒）
+HEARTBEAT_TTL_FACTOR = float(os.getenv("HB_TTL_FACTOR", "3.0"))         # TTL = 间隔 * 因子
+TRUST_PROXY = os.getenv("TRUST_PROXY", "1") == "1"                      # 若服务后有反代，读取 XFF 头
+REDIS_URL = os.getenv("REDIS_URL")                                      # e.g. redis://localhost:6379/0
 
-XF_APP_ID     = os.getenv("XF_APP_ID", "").strip()
-XF_API_KEY    = os.getenv("XF_API_KEY", "").strip()
-XF_API_SECRET = os.getenv("XF_API_SECRET", "").strip()
-TTS_VCN       = os.getenv("TTS_VCN", "xiaoyan").strip()
-TCP_HOST      = os.getenv("TCP_HOST", "0.0.0.0")
-TCP_PORT      = int(os.getenv("TCP_PORT", "38001"))
-assert XF_APP_ID and XF_API_KEY and XF_API_SECRET, "请配置 XF_APP_ID / XF_API_KEY / XF_API_SECRET"
+# ---------- 日志 ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+log = logging.getLogger("app")
 
-# --------- Web 服务（用于暴露静态 mp3）---------
-app = FastAPI(title="TCP Voice Gateway")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
-app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
+# ---------- 可选 Redis ----------
+redis = None
+try:
+    # redis>=5 支持 asyncio 客户端
+    import redis.asyncio as redis  # type: ignore
+except Exception:
+    redis = None
 
-@app.get("/")
-def index(): return FileResponse(str(WWW / "index.html"))
-@app.get("/health")
-def health(): return {"ok": True, "tcp": f"{TCP_HOST}:{TCP_PORT}"}
+# ---------- 工具 ----------
+def now_ts() -> float:
+    return time.time()
 
-# --------- 协议常量（小端）---------
-HD_SIZE = 32  # 8 * uint32
-SOF = 0x000000AA  # 你给的注释“byte0=0xAA”，这里直接用 0xAA
-CMD_SPEECH = 0x87     # 设备->服务器：语音帧(PCM 16k 16bit mono)
-CMD_INFORM = 0x94     # 服务器->设备：播放URL通知
-CMD_HEART  = 0x01     # 心跳(设备->服务器)，服务器回同 cmd
-FMT_PCM16  = 0x01     # u32fmt=01
+def utc_iso(ts: Optional[float] = None) -> str:
+    return datetime.fromtimestamp(ts or now_ts(), tz=timezone.utc).isoformat()
 
-# --------- 打包/解包工具（小端）---------
-def pack_header(sof, length, sendid, recvid, u32fmt, cmd, res, res2):
-    return struct.pack("<8I", sof, length, sendid, recvid, u32fmt, cmd, res, res2)
+def client_ip_from(request: Request) -> str:
+    if TRUST_PROXY:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+        xrip = request.headers.get("x-real-ip")
+        if xrip:
+            return xrip.strip()
+    return request.client.host if request.client else "unknown"
 
-def unpack_header(data: bytes):
-    sof, length, sendid, recvid, u32fmt, cmd, res, res2 = struct.unpack("<8I", data)
-    return {"sof": sof, "len": length, "sendid": sendid, "recvid": recvid,
-            "fmt": u32fmt, "cmd": cmd, "res": res, "res2": res2}
-
-# --------- 讯飞鉴权 ---------
-def build_wss_url(host: str, path: str) -> str:
-    date = datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
-    signature_origin = f"host: {host}\n" f"date: {date}\n" f"GET {path} HTTP/1.1"
-    digest = hmac.new(XF_API_SECRET.encode(), signature_origin.encode(), hashlib.sha256).digest()
-    signature = base64.b64encode(digest).decode()
-    authorization_origin = (f'api_key="{XF_API_KEY}", algorithm="hmac-sha256", '
-                            f'headers="host date request-line", signature="{signature}"')
-    authorization = base64.b64encode(authorization_origin.encode()).decode()
-    return f"wss://{host}{path}?authorization={quote(authorization)}&date={quote(date)}&host={host}"
-
-# --------- IAT 会话（吃 PCM16k）---------
-class IATSession:
-    def __init__(self,
-                 on_partial: Callable[[str], None],
-                 on_final: Callable[[str], None]):
-        self.closed = False
-        self.on_partial = on_partial
-        self.on_final = on_final
-        url = build_wss_url("iat-api.xfyun.cn", "/v2/iat")
-        self.ws = create_connection(url, sslopt={"cert_reqs": ssl.CERT_NONE})
-        first = {
-            "common": {"app_id": XF_APP_ID},
-            "business": {
-                "language": "zh_cn", "domain": "iat", "accent": "mandarin",
-                "vinfo": 1, "vad_eos": 3000
-            },
-            "data": {"status": 0, "format": "audio/L16;rate=16000", "encoding": "raw", "audio": ""}
-        }
-        self.ws.send(json.dumps(first))
-        self.t = asyncio.get_event_loop().run_in_executor(None, self._recv_loop)
-
-    def _recv_loop(self):
+# ---------- 访问日志中间件 ----------
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        t0 = time.perf_counter()
+        ip = client_ip_from(request)
+        ua = request.headers.get("user-agent", "-")
+        path = request.url.path
+        method = request.method
         try:
-            while not self.closed:
-                msg = self.ws.recv()
-                if not msg: continue
-                data = json.loads(msg)
-                if data.get("code", 0) != 0:
-                    logging.warning("[IAT] err: %s", data); continue
-                d = data.get("data", {})
-                st = d.get("status")
-                if "result" in d:
-                    ws = d["result"].get("ws", [])
-                    text = "".join([w["cw"][0]["w"] for w in ws if w.get("cw")])
-                    if st in (0, 1):
-                        self.on_partial(text)
-                    elif st == 2:
-                        self.on_final(text)
-        except WebSocketConnectionClosedException:
-            pass
-        except Exception as e:
-            logging.exception("[IAT] recv error: %s", e)
-
-    def send_pcm(self, pcm: bytes, last: bool=False):
-        if self.closed: return
-        frame = {"data": {
-            "status": 2 if last else 1, "format": "audio/L16;rate=16000",
-            "encoding": "raw", "audio": base64.b64encode(pcm).decode()
-        }}
-        try: self.ws.send(json.dumps(frame))
-        except Exception: self.closed = True
-
-    def close(self):
-        if self.closed: return
-        try:
-            self.send_pcm(b"", last=True)
-            self.ws.close()
+            response = await call_next(request)
+            status = response.status_code
+            return response
         finally:
-            self.closed = True
+            dur = (time.perf_counter() - t0) * 1000
+            log.info(json.dumps({
+                "type": "access",
+                "ip": ip,
+                "ua": ua,
+                "method": method,
+                "path": path,
+                "status": locals().get("status", "NA"),
+                "ms": round(dur, 2),
+            }))
 
-# --------- TTS（WebSocket流式，返回mp3字节）---------
-def tts_synth_to_mp3(text: str) -> bytes:
-    url = build_wss_url("tts-api.xfyun.cn", "/v2/tts")
-    ws = create_connection(url, sslopt={"cert_reqs": ssl.CERT_NONE})
-    first = {
-        "common": {"app_id": XF_APP_ID},
-        "business": {"aue": "lame", "vcn": TTS_VCN, "tte": "UTF8", "speed": 50, "pitch": 50, "volume": 50},
-        "data": {"status": 2, "text": base64.b64encode(text.encode("utf-8")).decode("utf-8")}
-    }
-    ws.send(json.dumps(first))
-    buf = bytearray()
-    try:
-        while True:
-            resp = json.loads(ws.recv())
-            if resp.get("code", 0) != 0:
-                raise RuntimeError(f"TTS error: {resp}")
-            d = resp.get("data", {})
-            if "audio" in d:
-                buf += base64.b64decode(d["audio"])
-            if d.get("status") == 2:
-                break
-    finally:
-        ws.close()
-    return bytes(buf)
+# ---------- 设备存储（内存回退 + Redis 优先） ----------
+class DeviceStore:
+    """抽象：保存设备注册、token、最后心跳时间、最近指标"""
+    async def init(self): ...
+    async def upsert_device(self, device_id: str, info: Dict[str, Any]): ...
+    async def set_token(self, device_id: str, token: str): ...
+    async def get_token(self, device_id: str) -> Optional[str]: ...
+    async def heartbeat(self, device_id: str, hb: Dict[str, Any], ttl: int): ...
+    async def list_devices(self) -> List[Dict[str, Any]]: ...
 
-# --------- 会话状态 ---------
-class ConnState:
-    def __init__(self, writer: asyncio.StreamWriter):
-        self.writer = writer
-        self.sendid = 0
-        self.peer_last = 0
-        self.iat: Optional[IATSession] = None
-        self.partial = ""
-        self.final = ""
-        self.buffer = bytearray()
+class MemoryStore(DeviceStore):
+    def __init__(self):
+        self._dev: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
 
-    def next_id(self):
-        self.sendid = (self.sendid + 1) & 0xFFFFFFFF
-        return self.sendid
+    async def init(self): ...
 
-# --------- 发送通知（URL）---------
-async def send_inform_url(st: ConnState, url: str, record_after_play: int = 1):
-    payload = url.encode("utf-8") + b"\x00"
-    length = HD_SIZE + len(payload)
-    hd = pack_header(SOF, length, st.next_id(), st.peer_last, FMT_PCM16, CMD_INFORM, record_after_play, 0)
-    st.writer.write(hd + payload)
-    await st.writer.drain()
-    logging.info("-> inform url (%dB): %s", len(payload), url)
+    async def upsert_device(self, device_id: str, info: Dict[str, Any]):
+        async with self._lock:
+            d = self._dev.setdefault(device_id, {})
+            d.update(info)
 
-# --------- 发送心跳回包 ---------
-async def send_heartbeat(st: ConnState):
-    length = HD_SIZE
-    hd = pack_header(SOF, length, st.next_id(), st.peer_last, FMT_PCM16, CMD_HEART, 0, 0)
-    st.writer.write(hd)
-    await st.writer.drain()
+    async def set_token(self, device_id: str, token: str):
+        async with self._lock:
+            d = self._dev.setdefault(device_id, {})
+            d["token"] = token
 
-# --------- LLM 占位（你明天接入真正大模型时换掉）---------
-def llm_reply(recognized_text: str) -> str:
-    if not recognized_text.strip():
-        return "抱歉，没有识别到有效语音。"
-    return f"我听到你说：“{recognized_text}”。已收到～"
+    async def get_token(self, device_id: str) -> Optional[str]:
+        async with self._lock:
+            return self._dev.get(device_id, {}).get("token")
 
-# --------- TCP 连接处理 ---------
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    peer = writer.get_extra_info("peername")
-    logging.info("TCP connected: %s", peer)
-    st = ConnState(writer)
+    async def heartbeat(self, device_id: str, hb: Dict[str, Any], ttl: int):
+        async with self._lock:
+            d = self._dev.setdefault(device_id, {})
+            d.setdefault("meta", {})
+            d["last_seen_ts"] = now_ts()
+            d["last_seen"] = utc_iso()
+            d["ttl"] = ttl
+            d["metrics"] = hb.get("metrics")
+            d["status"] = hb.get("status", "ok")
 
-    try:
-        buf = bytearray()
-        while True:
-            chunk = await reader.read(4096)
-            if not chunk: break
-            buf += chunk
+    async def list_devices(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            out = []
+            for did, d in self._dev.items():
+                last = d.get("last_seen_ts")
+                ttl = int(d.get("ttl") or HEARTBEAT_INTERVAL_DEFAULT * HEARTBEAT_TTL_FACTOR)
+                online = (now_ts() - (last or 0)) < ttl
+                out.append({
+                    "device_id": did,
+                    "token_set": bool(d.get("token")),
+                    "model": d.get("model"),
+                    "fw": d.get("fw"),
+                    "last_seen": d.get("last_seen"),
+                    "seconds_ago": None if last is None else int(now_ts() - last),
+                    "online": online,
+                    "status": d.get("status", "-"),
+                    "metrics": d.get("metrics"),
+                })
+            return out
 
-            # 解析粘包
-            while True:
-                if len(buf) < HD_SIZE: break
-                hd = unpack_header(buf[:HD_SIZE])
-                if hd["sof"] != SOF:  # 丢弃到下一个可能的头
-                    del buf[0:1]; continue
-                total_len = hd["len"]
-                if total_len < HD_SIZE or len(buf) < total_len: break
+class RedisStore(DeviceStore):
+    def __init__(self, url: str):
+        self._url = url
+        self._r = None
 
-                frame = bytes(buf[:total_len]); del buf[:total_len]
-                head = unpack_header(frame[:HD_SIZE])
-                payload = frame[HD_SIZE:]
-                st.peer_last = head["sendid"]
+    async def init(self):
+        self._r = redis.from_url(self._url, decode_responses=True)
 
-                cmd, res = head["cmd"], head["res"]
+    async def upsert_device(self, device_id: str, info: Dict[str, Any]):
+        await self._r.hset(f"dev:{device_id}", mapping=info)
+        await self._r.sadd("devices", device_id)
 
-                if cmd == CMD_HEART:
-                    # 心跳：立即回包
-                    await send_heartbeat(st)
-                    continue
+    async def set_token(self, device_id: str, token: str):
+        await self._r.hset(f"dev:{device_id}", "token", token)
+        await self._r.sadd("devices", device_id)
 
-                if cmd == CMD_SPEECH:
-                    # 设备直吐 PCM16k/16bit/mono
-                    if res == 0:  # 首帧
-                        st.partial = ""; st.final = ""
-                        if st.iat: st.iat.close()
-                        st.iat = IATSession(
-                            on_partial=lambda t: setattr(st, "partial", t),
-                            on_final  =lambda t: setattr(st, "final", t)
-                        )
-                    if st.iat:
-                        st.iat.send_pcm(payload, last=(res==2))
+    async def get_token(self, device_id: str) -> Optional[str]:
+        return await self._r.hget(f"dev:{device_id}", "token")
 
-                    if res == 2:  # 尾帧 -> 收口，做 TTS 并下发 URL
-                        await asyncio.sleep(0.25)
-                        if st.iat:
-                            st.iat.close(); st.iat = None
-                        rec_text = st.final or st.partial
-                        logging.info("[ASR] %s", rec_text)
-                        # （这里接入你的大模型）
-                        answer = llm_reply(rec_text)
-                        # 讯飞 TTS 合成
-                        try:
-                            mp3 = await asyncio.get_event_loop().run_in_executor(None, tts_synth_to_mp3, answer)
-                        except Exception as e:
-                            logging.exception("TTS failed: %s", e)
-                            continue
-                        mp3_name = f"{uuid.uuid4().hex}.mp3"
-                        (TTS_DIR / mp3_name).write_bytes(mp3)
-                        url = f"/static/tts/{mp3_name}"
-                        await send_inform_url(st, url, record_after_play=1)
-                    continue
+    async def heartbeat(self, device_id: str, hb: Dict[str, Any], ttl: int):
+        key = f"dev:{device_id}"
+        mapping = {
+            "last_seen_ts": str(now_ts()),
+            "last_seen": utc_iso(),
+            "ttl": str(ttl),
+            "status": hb.get("status", "ok"),
+            "metrics": json.dumps(hb.get("metrics", {})),
+        }
+        await self._r.hset(key, mapping=mapping)
+        await self._r.sadd("devices", device_id)
 
-                # 未知命令：忽略
-    except Exception as e:
-        logging.exception("TCP error %s: %s", peer, e)
-    finally:
-        try:
-            if st.iat: st.iat.close()
-        except: pass
-        writer.close()
-        await writer.wait_closed()
-        logging.info("TCP closed: %s", peer)
+    async def list_devices(self) -> List[Dict[str, Any]]:
+        devs = []
+        for did in await self._r.smembers("devices"):
+            h = await self._r.hgetall(f"dev:{did}")
+            last = float(h.get("last_seen_ts") or 0)
+            ttl = int(float(h.get("ttl") or HEARTBEAT_INTERVAL_DEFAULT * HEARTBEAT_TTL_FACTOR))
+            online = (now_ts() - last) < ttl if last else False
+            metrics = None
+            if "metrics" in h:
+                try:
+                    metrics = json.loads(h["metrics"])
+                except Exception:
+                    metrics = h["metrics"]
+            devs.append({
+                "device_id": did,
+                "token_set": "token" in h,
+                "model": h.get("model"),
+                "fw": h.get("fw"),
+                "last_seen": h.get("last_seen"),
+                "seconds_ago": None if last == 0 else int(now_ts() - last),
+                "online": online,
+                "status": h.get("status", "-"),
+                "metrics": metrics,
+            })
+        return devs
 
-# --------- 启动 TCP server ---------
+# ---------- 依赖注入 ----------
+store: DeviceStore = MemoryStore()  # 默认内存；若配置了 REDIS_URL 且库可用，启动时替换
+
+async def get_store() -> DeviceStore:
+    return store
+
+# ---------- 数据模型 ----------
+class RegisterReq(BaseModel):
+    device_id: str = Field(..., min_length=1)
+    model: Optional[str] = None
+    fw: Optional[str] = None
+    token: Optional[str] = None  # 设备若自带 token 也可上报
+
+class RegisterResp(BaseModel):
+    device_id: str
+    token: str
+    next_heartbeat_in: int = HEARTBEAT_INTERVAL_DEFAULT
+
+class HeartbeatReq(BaseModel):
+    device_id: str
+    token: str
+    status: Optional[str] = "ok"
+    metrics: Optional[Dict[str, Any]] = None
+    suggested_interval: Optional[int] = None  # 设备也可请求新间隔
+
+class HeartbeatResp(BaseModel):
+    device_id: str
+    accepted: bool
+    next_heartbeat_in: int
+    server_time: str
+
+# ---------- 应用 ----------
+app = FastAPI(title="Device Backend with Heartbeat")
+app.add_middleware(AccessLogMiddleware)
+
 @app.on_event("startup")
-async def _start_tcp():
-    server = await asyncio.start_server(handle_client, TCP_HOST, TCP_PORT)
-    app.state.tcp_server = server
-    host, port = server.sockets[0].getsockname()
-    logging.info("TCP server listening on %s:%s", host, port)
+async def _startup():
+    global store
+    if REDIS_URL and redis is not None:
+        try:
+            rs = RedisStore(REDIS_URL)
+            await rs.init()
+            store = rs
+            log.info("DeviceStore=Redis | url=%s", REDIS_URL)
+        except Exception as e:
+            log.warning("Redis init failed: %s, fallback to MemoryStore", e)
+    else:
+        log.info("DeviceStore=Memory")
+    log.info(json.dumps({"type": "startup", "time": utc_iso()}))
 
 @app.on_event("shutdown")
-async def _stop_tcp():
-    srv = getattr(app.state, "tcp_server", None)
-    if srv: srv.close(); await srv.wait_closed()
+async def _shutdown():
+    log.info(json.dumps({"type": "shutdown", "time": utc_iso()}))
+
+# ---------- 小工具：简易鉴权 ----------
+async def ensure_device_token(req: HeartbeatReq, st: DeviceStore):
+    token_saved = await st.get_token(req.device_id)
+    if not token_saved:
+        raise HTTPException(401, "device not registered")
+    if token_saved != req.token:
+        raise HTTPException(403, "invalid token")
+
+# ---------- 路由 ----------
+@app.get("/whoami")
+async def whoami(request: Request):
+    return {
+        "ip": client_ip_from(request),
+        "ua": request.headers.get("user-agent"),
+        "xff": request.headers.get("x-forwarded-for"),
+        "time": utc_iso(),
+    }
+
+@app.post("/device/register", response_model=RegisterResp)
+async def register(payload: RegisterReq, request: Request, st: DeviceStore = Depends(get_store)):
+    ip = client_ip_from(request)
+    token = payload.token or uuid.uuid4().hex
+    await st.upsert_device(payload.device_id, {
+        "model": payload.model,
+        "fw": payload.fw,
+        "registered_ip": ip,
+        "registered_at": utc_iso(),
+    })
+    await st.set_token(payload.device_id, token)
+    log.info(json.dumps({
+        "type": "device_register",
+        "device_id": payload.device_id,
+        "ip": ip,
+        "model": payload.model,
+        "fw": payload.fw,
+    }))
+    return RegisterResp(device_id=payload.device_id, token=token, next_heartbeat_in=HEARTBEAT_INTERVAL_DEFAULT)
+
+@app.post("/device/heartbeat", response_model=HeartbeatResp)
+async def heartbeat(payload: HeartbeatReq, request: Request, st: DeviceStore = Depends(get_store)):
+    await ensure_device_token(payload, st)
+    interval = payload.suggested_interval or HEARTBEAT_INTERVAL_DEFAULT
+    ttl = int(interval * HEARTBEAT_TTL_FACTOR)
+    await st.heartbeat(payload.device_id, payload.dict(), ttl=ttl)
+
+    log.info(json.dumps({
+        "type": "heartbeat",
+        "device_id": payload.device_id,
+        "ip": client_ip_from(request),
+        "status": payload.status,
+        "interval": interval,
+        "ttl": ttl,
+    }))
+    return HeartbeatResp(
+        device_id=payload.device_id,
+        accepted=True,
+        next_heartbeat_in=interval,
+        server_time=utc_iso(),
+    )
+
+@app.get("/devices/online")
+async def devices_online(only_online: bool = Query(False), st: DeviceStore = Depends(get_store)):
+    items = await st.list_devices()
+    if only_online:
+        items = [x for x in items if x.get("online")]
+    # 排序：在线优先、最近心跳靠前
+    items.sort(key=lambda x: (not x.get("online"), x.get("seconds_ago") or 10**9))
+    return {"count": len(items), "items": items, "time": utc_iso()}
+
+# ---------- WebSocket（可选） ----------
+@app.websocket("/ws/{device_id}")
+async def ws_device(ws: WebSocket, device_id: str, token: Optional[str] = Query(None), st: DeviceStore = Depends(get_store)):
+    await ws.accept()
+    # 简易鉴权（可选）
+    saved = await st.get_token(device_id)
+    if saved and token != saved:
+        await ws.send_json({"error": "invalid token"})
+        await ws.close(code=4403)
+        return
+    log.info(json.dumps({"type": "ws_open", "device_id": device_id, "time": utc_iso()}))
+    try:
+        while True:
+            msg = await ws.receive_text()
+            # 任何收到的消息都当做“活跃心跳”来记录
+            await st.heartbeat(device_id, {"status": "ws", "metrics": {"msg": "pong"}}, ttl=int(HEARTBEAT_INTERVAL_DEFAULT * HEARTBEAT_TTL_FACTOR))
+            await ws.send_text("ok")
+    except WebSocketDisconnect:
+        log.info(json.dumps({"type": "ws_close", "device_id": device_id, "time": utc_iso()}))
